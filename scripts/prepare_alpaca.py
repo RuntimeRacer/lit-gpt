@@ -26,6 +26,7 @@ def prepare(
     data_file_url: str = "https://raw.githubusercontent.com/tloen/alpaca-lora/main/alpaca_data_cleaned_archive.json",
     ignore_index: int = -1,
     max_seq_length: Optional[int] = None,
+    prompt_style: str = "alpaca",
 ) -> None:
     """Prepare the Alpaca dataset for instruction tuning.
 
@@ -64,6 +65,7 @@ def prepare(
             max_length=max_seq_length,
             mask_inputs=mask_inputs,
             ignore_index=ignore_index,
+            prompt_style = prompt_style,
         )
         for sample in tqdm(train_set)
     ]
@@ -77,6 +79,7 @@ def prepare(
             max_length=max_seq_length,
             mask_inputs=mask_inputs,
             ignore_index=ignore_index,
+            prompt_style=prompt_style,
         )
         for sample in tqdm(test_set)
     ]
@@ -91,7 +94,7 @@ def download_if_missing(file_path: Path, file_url: str) -> None:
         f.write(requests.get(file_url).text)
 
 
-def prepare_sample(example: dict, tokenizer: Tokenizer, max_length: int, mask_inputs: bool, ignore_index: int) -> dict:
+def prepare_sample(example: dict, tokenizer: Tokenizer, max_length: int, mask_inputs: bool, ignore_index: int, prompt_style: str = "alpaca") -> dict:
     """Processes a single sample.
 
     Each sample in the dataset consists of:
@@ -108,8 +111,12 @@ def prepare_sample(example: dict, tokenizer: Tokenizer, max_length: int, mask_in
     Finally, both the prompt and the label get tokenized. If desired, all tokens
     in the label that correspond to the original input prompt get masked out (default).
     """
-    full_prompt = generate_prompt(example)
-    full_prompt_and_response = full_prompt + example["output"]
+    full_prompt = generate_prompt(example, prompt_style)
+    if prompt_style == "llama2":
+        full_prompt_and_response = full_prompt + example["output"] + "</s>"
+    else:
+        full_prompt_and_response = full_prompt + example["output"]
+
     encoded_full_prompt = tokenizer.encode(full_prompt, max_length=max_length)
     encoded_full_prompt_and_response = tokenizer.encode(full_prompt_and_response, eos=True, max_length=max_length)
 
@@ -126,21 +133,42 @@ def prepare_sample(example: dict, tokenizer: Tokenizer, max_length: int, mask_in
     }
 
 
-def generate_prompt(example: dict) -> str:
+def generate_prompt(example: dict, prompt_style: str = "alpaca") -> str:
     """Generates a standardized message to prompt the model with an instruction, optional input and a
     'response' field."""
 
-    if example["input"]:
+    if prompt_style == "alpaca":
+        if example["input"]:
+            return (
+                "Below is an instruction that describes a task, paired with an input that provides further context. "
+                "Write a response that appropriately completes the request.\n\n"
+                f"### Instruction:\n{example['instruction']}\n\n### Input:\n{example['input']}\n\n### Response:"
+            )
         return (
-            "Below is an instruction that describes a task, paired with an input that provides further context. "
+            "Below is an instruction that describes a task. "
             "Write a response that appropriately completes the request.\n\n"
-            f"### Instruction:\n{example['instruction']}\n\n### Input:\n{example['input']}\n\n### Response:"
+            f"### Instruction:\n{example['instruction']}\n\n### Response:"
         )
-    return (
-        "Below is an instruction that describes a task. "
-        "Write a response that appropriately completes the request.\n\n"
-        f"### Instruction:\n{example['instruction']}\n\n### Response:"
-    )
+    elif prompt_style == "llama2":
+        # https://huggingface.co/blog/llama2#how-to-prompt-llama-2
+        # https://www.reddit.com/r/LocalLLaMA/comments/155po2p/get_llama_2_prompt_format_right/
+        if example["input"]:
+            return (
+                "<s>[INST] <<SYS>>\n"
+                "Below is an instruction that describes a task, paired with an input that provides further context. "
+                "Write a response that appropriately completes the request.\n"
+                "<</SYS>>\n\n"
+                f"### Instruction:\n{example['instruction']}\n\n### Input:\n{example['input']}\n\n### Response:[/INST]"
+            )
+        return (
+            "<s>[INST] <<SYS>>\n"
+            "Below is an instruction that describes a task. "
+            "Write a response that appropriately completes the request.\n"
+            "<</SYS>>\n\n"
+            f"### Instruction:\n{example['instruction']}\n\n### Response:[/INST]"
+        )
+    else:
+        raise RuntimeError("unknown prompt style {0}".format(prompt_style))
 
 
 if __name__ == "__main__":
