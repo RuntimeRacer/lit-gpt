@@ -214,7 +214,7 @@ def train(
 
             iter_t0 = time.perf_counter()
 
-            input_ids, targets = get_batch(fabric, train_data, longest_seq_ix if iter_num == 1 else None)
+            input_ids, targets = get_batch(fabric, train_subset, longest_seq_ix if iter_num == 1 else None)
 
             is_accumulating = iter_num % gradient_accumulation_iters != 0
             with fabric.no_backward_sync(model, enabled=is_accumulating):
