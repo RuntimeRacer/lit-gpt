@@ -179,7 +179,14 @@ def train(
     total_batches = int(math.ceil(float(max_iters) / float(batch_size)))
 
     fabric.print(f"Total Iterations: {max_iters} - Running through {total_batches} batches of size {batch_size}")
+
     train_time = time.perf_counter()
+    total_lengths = 0
+    total_t0 = time.perf_counter()
+
+    # Get overall max seq length for the model
+    longest_seq_length, longest_seq_ix = get_longest_seq_length(train_data)
+    model.max_seq_length = min(longest_seq_length, max_seq_length or float("inf"))
 
     validate(fabric, model, val_data, tokenizer, max_iters=2)  # sanity check
 
@@ -192,8 +199,8 @@ def train(
             subset_end_idx = max_iters
         train_subset = train_data[subset_start_idx:subset_end_idx]
 
+        # Get max seq length for the batch
         longest_seq_length, longest_seq_ix = get_longest_seq_length(train_subset)
-        model.max_seq_length = min(longest_seq_length, max_seq_length or float("inf"))
         fabric.print(
             f"The longest sequence length in the train data of batch {batch_num} is {longest_seq_length},"
             f" the model's maximum sequence length is"
@@ -201,9 +208,7 @@ def train(
         )
 
         throughput = ThroughputMonitor(fabric, window_size=50)
-        step_count = subset_start_idx
-        total_lengths = 0
-        total_t0 = time.perf_counter()
+        step_count = batch_num
 
         for iter_num in range(subset_start_idx + 1, subset_end_idx + 1):
             if step_count <= warmup_steps:
