@@ -1,3 +1,4 @@
+import math
 import os
 import sys
 import time
@@ -36,12 +37,12 @@ devices = 1
 
 # Hyperparameters
 learning_rate = 3e-4
-batch_size = 128
+batch_size = 128  # Max Amount of prompts to load into memory; reduce this value if you run into OOM issues
 micro_batch_size = 4
 gradient_accumulation_iters = batch_size // micro_batch_size
 assert gradient_accumulation_iters > 0
 max_seq_length = None  # assign value to truncate
-max_iters = 50000  # train dataset size
+max_iters = "auto"  # train dataset size; set to "auto" to determine dataset size from train subset
 weight_decay = 0.01
 lora_r = 8
 lora_alpha = 16
@@ -97,6 +98,8 @@ def setup(
 
 
 def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path) -> None:
+    global max_iters
+
     check_valid_checkpoint_dir(checkpoint_dir)
 
     fabric.seed_everything(1337)  # same seed for every process to init model (FSDP)
@@ -106,6 +109,9 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path) 
 
     train_data = torch.load(data_dir / "train.pt")
     val_data = torch.load(data_dir / "test.pt")
+
+    if max_iters == "auto":
+        max_iters = len(train_data)
 
     if not any((lora_query, lora_key, lora_value, lora_projection, lora_mlp, lora_head)):
         fabric.print("Warning: all LoRA layers are disabled!")
@@ -169,68 +175,89 @@ def train(
     out_dir: Path,
 ) -> None:
     tokenizer = Tokenizer(checkpoint_dir)
-    longest_seq_length, longest_seq_ix = get_longest_seq_length(train_data)
-    model.max_seq_length = min(longest_seq_length, max_seq_length or float("inf"))
-    fabric.print(
-        f"The longest sequence length in the train data is {longest_seq_length}, the model's maximum sequence length is"
-        f" {model.max_seq_length} and context length is {model.config.block_size}"
-    )
+
+    total_batches = int(math.ceil(float(max_iters) / float(batch_size)))
+
+    fabric.print(f"Total Iterations: {max_iters} - Running through {total_batches} batches of size {batch_size}")
+    train_time = time.perf_counter()
 
     validate(fabric, model, val_data, tokenizer, max_iters=2)  # sanity check
 
-    throughput = ThroughputMonitor(fabric, window_size=50)
-    step_count = 0
-    total_lengths = 0
-    total_t0 = time.perf_counter()
+    for batch_num in range(0, total_batches):
+        fabric.print(f"Running batch {batch_num}/{total_batches}")
 
-    for iter_num in range(1, max_iters + 1):
-        if step_count <= warmup_steps:
-            # linear warmup
-            lr = learning_rate * step_count / warmup_steps
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = lr
+        subset_start_idx = 0 + batch_num * batch_size
+        subset_end_idx = batch_size + batch_num * batch_size
+        if subset_end_idx > max_iters:
+            subset_end_idx = max_iters
+        train_subset = train_data[subset_start_idx:subset_end_idx]
 
-        iter_t0 = time.perf_counter()
+        longest_seq_length, longest_seq_ix = get_longest_seq_length(train_subset)
+        model.max_seq_length = min(longest_seq_length, max_seq_length or float("inf"))
+        fabric.print(
+            f"The longest sequence length in the train data of batch {batch_num} is {longest_seq_length},"
+            f" the model's maximum sequence length is"
+            f" {model.max_seq_length} and context length is {model.config.block_size}"
+        )
 
-        input_ids, targets = get_batch(fabric, train_data, longest_seq_ix if iter_num == 1 else None)
+        throughput = ThroughputMonitor(fabric, window_size=50)
+        step_count = subset_start_idx
+        total_lengths = 0
+        total_t0 = time.perf_counter()
 
-        is_accumulating = iter_num % gradient_accumulation_iters != 0
-        with fabric.no_backward_sync(model, enabled=is_accumulating):
-            logits = model(input_ids, lm_head_chunk_size=128)
-            # shift the targets such that output n predicts token n+1
-            logits[-1] = logits[-1][..., :-1, :]
-            loss = chunked_cross_entropy(logits, targets[..., 1:])
-            fabric.backward(loss / gradient_accumulation_iters)
+        for iter_num in range(subset_start_idx + 1, subset_end_idx + 1):
+            if step_count <= warmup_steps:
+                # linear warmup
+                lr = learning_rate * step_count / warmup_steps
+                for param_group in optimizer.param_groups:
+                    param_group["lr"] = lr
 
-        if not is_accumulating:
-            optimizer.step()
-            optimizer.zero_grad()
-            if step_count > warmup_steps:
-                scheduler.step()
-            step_count += 1
+            iter_t0 = time.perf_counter()
 
-        total_lengths += input_ids.numel()
-        if iter_num % log_interval == 0:
-            loss_item = loss.item()  # expensive device-to-host synchronization
-            t1 = time.perf_counter()
-            throughput.update(
-                time=t1 - total_t0, batches=iter_num, samples=iter_num * micro_batch_size, lengths=total_lengths
-            )
-            throughput.compute_and_log(step=iter_num)
-            fabric.print(
-                f"iter {iter_num} step {step_count}: loss {loss_item:.4f}, iter time:"
-                f" {(t1 - iter_t0) * 1000:.2f}ms{' (optimizer.step)' if not is_accumulating else ''}"
-            )
+            input_ids, targets = get_batch(fabric, train_data, longest_seq_ix if iter_num == 1 else None)
 
-        if not is_accumulating and step_count % eval_interval == 0:
-            t0 = time.perf_counter()
-            val_loss = validate(fabric, model, val_data, tokenizer, max_iters=eval_iters)
-            t1 = time.perf_counter() - t0
-            fabric.print(f"step {iter_num}: val loss {val_loss.item():.4f}, val time: {t1 * 1000:.2f}ms")
-            fabric.barrier()
-        if not is_accumulating and step_count % save_interval == 0:
-            checkpoint_path = out_dir / f"iter-{iter_num:06d}-ckpt.pth"
-            save_lora_checkpoint(fabric, model, checkpoint_path)
+            is_accumulating = iter_num % gradient_accumulation_iters != 0
+            with fabric.no_backward_sync(model, enabled=is_accumulating):
+                logits = model(input_ids, lm_head_chunk_size=128)
+                # shift the targets such that output n predicts token n+1
+                logits[-1] = logits[-1][..., :-1, :]
+                loss = chunked_cross_entropy(logits, targets[..., 1:])
+                fabric.backward(loss / gradient_accumulation_iters)
+
+            if not is_accumulating:
+                optimizer.step()
+                optimizer.zero_grad()
+                if step_count > warmup_steps:
+                    scheduler.step()
+                step_count += 1
+
+            total_lengths += input_ids.numel()
+            if iter_num % log_interval == 0:
+                loss_item = loss.item()  # expensive device-to-host synchronization
+                t1 = time.perf_counter()
+                throughput.update(
+                    time=t1 - total_t0, batches=iter_num, samples=iter_num * micro_batch_size, lengths=total_lengths
+                )
+                throughput.compute_and_log(step=iter_num)
+                fabric.print(
+                    f"iter {iter_num} step {step_count}: loss {loss_item:.4f}, iter time:"
+                    f" {(t1 - iter_t0) * 1000:.2f}ms{' (optimizer.step)' if not is_accumulating else ''}"
+                )
+
+            if not is_accumulating and step_count % eval_interval == 0:
+                t0 = time.perf_counter()
+                val_loss = validate(fabric, model, val_data, tokenizer, max_iters=eval_iters)
+                t1 = time.perf_counter() - t0
+                fabric.print(f"step {iter_num}: val loss {val_loss.item():.4f}, val time: {t1 * 1000:.2f}ms")
+                fabric.barrier()
+            if not is_accumulating and step_count % save_interval == 0:
+                checkpoint_path = out_dir / f"iter-{iter_num:06d}-ckpt.pth"
+                save_lora_checkpoint(fabric, model, checkpoint_path)
+
+        fabric.print(f"Finished training batch {batch_num}/{total_batches}")
+        fabric.print(f"Time elapsed: {(time.perf_counter() - train_time):.2f}s")
+        if fabric.device.type == "cuda":
+            fabric.print(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB")
 
 
 # FSDP has issues with `inference_mode`
